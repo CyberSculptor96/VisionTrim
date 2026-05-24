@@ -14,7 +14,7 @@ fi
 
 layer=$1
 token_num=$2
-answers_file="$DATA_DIR/answers/$METHOD/layer${layer}_token${token_num}.jsonl"
+answers_file="$DATA_DIR/answers/$METHOD/$token_num.jsonl"
 
 if [[ ! -d "$DATA_DIR/coco" || ! -d "$DATA_DIR/val2014" || ! -f "$DATA_DIR/llava_pope_test.jsonl" ]]; then
     echo "Missing POPE data under $DATA_DIR"

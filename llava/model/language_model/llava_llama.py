@@ -394,9 +394,16 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
 
     def post_config(self,args):
         self.method = args.method
-        if hasattr(args, "token_num"):
-            self.token_num = args.token_num
-        if hasattr(args, "layer"):
+        self.DVTS_token_num = getattr(args, "DVTS_token_num", None)
+        if self.DVTS_token_num is None:
+            self.DVTS_token_num = getattr(args, "token_num", None)
+        if self.DVTS_token_num is None:
+            self.DVTS_token_num = 36
+        self.token_num = self.DVTS_token_num
+        self.TGVC_token_num = getattr(args, "TGVC_token_num", 0)
+        if self.TGVC_token_num is None:
+            self.TGVC_token_num = 0
+        if hasattr(args, "layer") and args.layer is not None:
             self.layer = int(args.layer)
         if hasattr(args, "dataset_name"):
             if args.dataset_name != 'none':
