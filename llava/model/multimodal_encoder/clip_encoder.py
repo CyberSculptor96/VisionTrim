@@ -470,7 +470,7 @@ class CLIPVisionTower(nn.Module):
         token_scores = text_to_image_similarity.mean(dim=1)  #  (B, text_token_num, 576-token_num) -> (B, 576-token_num) 计算文本特征与未被选中的图像特征之间的相似度，得到每个未被选中token的得分，形状为[bs, 576-token_num]，表示每个未被选中token与文本的平均相似度得分
         #token_scores = image_to_text_similarity.mean(dim=2)  # (B, 576-token_num, text_token_num) -> (B, 576-token_num) 计算每个未被选中token与文本的平均相似度得分，形状为[bs, 576-token_num]，表示每个未被选中token与文本的平均相似度得分
         
-        
+        #complement_num = 0
         complement_num = 64-token_num  # 计算需要补充的token数量，即总token数量减去被选中token的数量，这里假设最终需要保留64个token，如果被选中token数量为token_num，那么需要从未被选中token中补充complement_num个token
 
         if complement_num > 0:

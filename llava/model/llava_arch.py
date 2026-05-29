@@ -225,132 +225,141 @@ class LlavaMetaForCausalLM(ABC):
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
-    def prepare_inputs_labels_for_multimodal(
+    def prepare_inputs_labels_for_multimodal(  # 
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
         images, image_sizes=None
-    ):
+    ): 
         vision_tower = self.get_vision_tower()
-        if vision_tower is None or images is None or input_ids.shape[1] == 1:
+        if vision_tower is None or images is None or input_ids.shape[1] == 1: #
             return input_ids, position_ids, attention_mask, past_key_values, None, labels,None
 
-        if type(images) is list or images.ndim == 5:
+        if type(images) is list or images.ndim == 5: # 如果输入的 images 是一个 list，或者是一个 5 维的 tensor（batch_size, num_images, C, H, W），就说明每个样本可能有不同数量的图像，需要分别编码后再拼接。否则就直接把 images 当成一个 batch 来编码。
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
             image_features = self.encode_images(concat_images)
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
+
+            
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
             image_aspect_ratio = getattr(self.config, 'image_aspect_ratio', 'square')
             if mm_patch_merge_type == 'flat':
                 image_features = [x.flatten(0, 1) for x in image_features]
-            elif mm_patch_merge_type.startswith('spatial'):
+            elif mm_patch_merge_type.startswith('spatial'): # 
                 new_image_features = []
                 for image_idx, image_feature in enumerate(image_features):
-                    if image_feature.shape[0] > 1:
+                    if image_feature.shape[0] > 1: # 如果图像被编码成了多个 token 了（比如 CLS token + patch token），就把这些 token 进行空间排列和拼接
                         base_image_feature = image_feature[0]
                         image_feature = image_feature[1:]
                         height = width = self.get_vision_tower().num_patches_per_side
                         assert height * width == base_image_feature.shape[0]
                         if image_aspect_ratio == 'anyres':
                             num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx], self.config.image_grid_pinpoints, self.get_vision_tower().config.image_size)
-                            image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
+                            image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1) # view：把一维 token 序列恢复成空间网格
                         else:
                             raise NotImplementedError
-                        if 'unpad' in mm_patch_merge_type:
-                            image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
-                            image_feature = image_feature.flatten(1, 2).flatten(2, 3)
-                            image_feature = unpad_image(image_feature, image_sizes[image_idx])
+                        if 'unpad' in mm_patch_merge_type: 
+                            # 外层网格：H_g × W_g，每个外层图像块内部：h × w 个 patch token，每个 token 特征维度：C
+                            image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous() # image_feature.shape = [H_g, W_g, h, w, C] 
+                            
+                            image_feature = image_feature.flatten(1, 2).flatten(2, 3) # 两次 flatten：拼接外层图像块和内层 patch 网格, flatten后：image_feature.shape = [C, H_g * h, W_g * w]
+                            image_feature = unpad_image(image_feature, image_sizes[image_idx]) # unpad_image：去除 padding 区域。 输出：image_feature.shape = [C, H_real, W_real]
                             image_feature = torch.cat((
                                 image_feature,
                                 self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)
                             ), dim=-1)
-                            image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+                            image_feature = image_feature.flatten(1, 2).transpose(0, 1) #image_feature.shape = [ H_real* (W_real+1),C]
                         else:
-                            image_feature = image_feature.permute(0, 2, 1, 3, 4).contiguous()
-                            image_feature = image_feature.flatten(0, 3)
-                        image_feature = torch.cat((base_image_feature, image_feature), dim=0)
-                    else:
+                            image_feature = image_feature.permute(0, 2, 1, 3, 4).contiguous() # image_feature.shape = [H_g, h, W_g, w, C]
+                            image_feature = image_feature.flatten(0, 3) # flatten：把外层图像块和内层 patch 网格一起拼接成一个 token 序列，image_feature.shape = [H_g * h * W_g * w, C]
+                        image_feature = torch.cat((base_image_feature, image_feature), dim=0) # 把 CLS token 和 patch token 拼接在一起，image_feature.shape = [(H_g * h * W_g * w + 1), C]
+                    else: # 如果图像被编码成了一个 token 了（比如 CLS token），就直接用这个 token 作为图像特征
                         image_feature = image_feature[0]
                         if 'unpad' in mm_patch_merge_type:
                             image_feature = torch.cat((
                                 image_feature,
                                 self.model.image_newline[None].to(image_feature.device)
-                            ), dim=0)
-                    new_image_features.append(image_feature)
-                image_features = new_image_features
+                            ), dim=0) # self.model.image_newline[None]：给单 token 图像特征拼接一个 learnable 的 newline token，image_feature.shape = [C+1]
+                    new_image_features.append(image_feature) 
+                image_features = new_image_features 
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
-        else:
+        else: # 如果输入的 images 是一个 4 维的 tensor（batch_size, C, H, W），就说明每个样本只有一张图像，可以直接把这个 batch 的图像一起编码。
             image_features = self.encode_images(images)
 
         # TODO: image start / end is not implemented here to support pretraining.
-        if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
-            raise NotImplementedError
+        if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False): 
+            raise NotImplementedError 
         # Let's just add dummy tensors if they do not exist,
         # it is a headache to deal with None all the time.
         # But it is not ideal, and if you have a better idea,
         # please open an issue / submit a PR, thanks.
         _labels = labels
         _position_ids = position_ids
-        _attention_mask = attention_mask
+        _attention_mask = attention_mask # attention_mask [batch_size, seq_len], bool or float
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
         else:
             attention_mask = attention_mask.bool()
         if position_ids is None:
-            position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device)
-        if labels is None:
+            position_ids = torch.arange(0, input_ids.shape[1], dtype=torch.long, device=input_ids.device) # input_ids.shape[1] 是 seq_len
+        if labels is None: # 如果没有提供 labels，就创建一个全是 IGNORE_INDEX 的 labels，这样在计算 loss 的时候就不会对这些位置计算 loss。
             labels = torch.full_like(input_ids, IGNORE_INDEX)
 
         # remove the padding using attention_mask -- FIXME
-        _input_ids = input_ids
-        input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
+        _input_ids = input_ids # 保留原始的 input_ids 以便后续使用
+        input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)] # 根据 attention_mask 把 input_ids 中的 padding token 去掉，得到一个 list，每个元素是一个样本去掉 padding 后的 input_ids。
+        #注意这里假设了 padding token 的位置在 attention_mask 中是 False。
         labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
         
-        images_idx = [torch.where(cur_input_ids == IMAGE_TOKEN_INDEX) for cur_input_ids in _input_ids]
+        images_idx = [torch.where(cur_input_ids == IMAGE_TOKEN_INDEX) for cur_input_ids in _input_ids] # 找到每个样本中 IMAGE_TOKEN_INDEX 的位置，这些位置就是图像 token 在 input_ids 中的位置。
+        #images_idx 是一个 list，每个元素是一个 tuple，包含了该样本中所有图像 token 的位置索引。 IMAGE_TOKEN_INDEX 是一个特殊的 token id，表示图像 token 的位置。通过这个索引，我们可以知道图像 token 在 input_ids 中应该被替换成对应的 image_features。
 
         new_input_embeds = []
         new_labels = []
         cur_image_idx = 0
-        for batch_idx, cur_input_ids in enumerate(input_ids):
-            num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
-            if num_images == 0:
-                cur_image_features = image_features[cur_image_idx]
-                cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
-                cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0)
+        for batch_idx, cur_input_ids in enumerate(input_ids): #input_ids[batch_idx] 是一个样本去掉 padding 后的 input_ids，cur_input_ids.shape = [seq_len_no_pad]
+            num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum() # 计算当前样本中图像 token 的数量，也就是需要插入多少个 image_features。
+            if num_images == 0: # 如果当前样本中没有图像 token，就直接把文本 token 的 input_ids 转换成 input_embeds，然后添加到 new_input_embeds 中，同时把对应的 labels 添加到 new_labels 中。
+                cur_image_features = image_features[cur_image_idx] #image_features[cur_image_idx].shape = [N_img_tokens, C]
+                cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids) #文本token转换为embedding，cur_input_embeds_1.shape = [seq_len_no_pad, hidden_size]
+                cur_input_embeds = torch.cat([cur_input_embeds_1, cur_image_features[0:0]], dim=0) # 拼接一个空的图像特征
                 new_input_embeds.append(cur_input_embeds)
                 new_labels.append(labels[batch_idx])
                 cur_image_idx += 1
                 continue
-
+            # 
             image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
-            cur_input_ids_noim = []
-            cur_labels = labels[batch_idx]
-            cur_labels_noim = []
+            #初始化无图像文本段列表
+            cur_input_ids_noim = [] # 存当前样本中去掉 IMAGE_TOKEN_INDEX 后的各段文本 token
+            cur_labels = labels[batch_idx] #当前样本 labels，cur_labels.shape = [cur_seq_len]
+            cur_labels_noim = [] # 存和 cur_input_ids_noim 对齐的 label 段。
+            #按 image token 切分文本和 labels，得到一个 list，每个元素是一个文本段的 input_ids 和 labels，这些文本段之间就是图像 token 需要插入 image_features 的位置。
             for i in range(len(image_token_indices) - 1):
                 cur_input_ids_noim.append(cur_input_ids[image_token_indices[i]+1:image_token_indices[i+1]])
                 cur_labels_noim.append(cur_labels[image_token_indices[i]+1:image_token_indices[i+1]])
-            split_sizes = [x.shape[0] for x in cur_labels_noim]
-            cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
-            cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
+            split_sizes = [x.shape[0] for x in cur_labels_noim] # 记录每段文本长度，以便后续把文本段转换成 embedding 后再正确地插入 image_features。
+            cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))# 把当前样本中去掉 IMAGE_TOKEN_INDEX 后的文本 token 的 input_ids 拼接成一个长的 input_ids，然后一次性转换成 embedding，cur_input_embeds.shape = [sum_of_text_segments_len, hidden_size]
+            cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0) # 把一次性 embedding 后的文本 embedding 按之前的段长度切回：
+            # 初始化当前样本的新 embedding 和 label 列表
             cur_new_input_embeds = []
             cur_new_labels = []
-
+            #交替插入文本段和图像特征，具体来说，就是先插入第一段文本 embedding，然后插入第一张图像的 image_features，然后插入第二段文本 embedding，然后插入第二张图像的 image_features
+            #以此类推，直到最后一段文本 embedding。注意图像特征的插入位置是根据之前记录的 image_token_indices 来确定的。
             for i in range(num_images + 1):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
                 cur_new_labels.append(cur_labels_noim[i])
-                if i < num_images:
+                if i < num_images: # 如果当前位置后面有图像，则插入图像 token
                     cur_image_features = image_features[cur_image_idx]
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
-                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                    cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype)) # 图像 token 的 label 全部设置为 IGNORE_INDEX，这样在计算 loss 的时候就不会对这些位置计算 loss。
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
 
-            cur_new_input_embeds = torch.cat(cur_new_input_embeds)
+            cur_new_input_embeds = torch.cat(cur_new_input_embeds) #  cur_new_input_embeds.shape= [L_0 + N_img_0 + L_1 + ... + N_img_{M-1} + L_M, C]
             cur_new_labels = torch.cat(cur_new_labels)
-
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
 

@@ -1,0 +1,31 @@
+You are using a model of type llava to instantiate a model of type llava_llama. This is not supported for all configurations of models and can yield errors.
+self.dtype is torch.float16
+mm_projector has been build here.
+the self.mm_projector is Sequential(
+  (0): Linear(in_features=1024, out_features=4096, bias=True)
+  (1): GELU(approximate='none')
+  (2): Linear(in_features=4096, out_features=4096, bias=True)
+)
+self.model has been initialized in LlavaLlamaModel
+self.model has been initialized in LlavaLlamaForCausalLM
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [01:06<01:06, 66.47s/it]Loading checkpoint shards:  50%|█████     | 1/2 [01:23<01:23, 83.40s/it]
+Traceback (most recent call last):
+  File "/idas/users/baoshichao/.conda/envs/visiontrim/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/idas/users/baoshichao/.conda/envs/visiontrim/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/data/users/baoshichao/VisionTrim/llava/eval/model_vqa_loader.py", line 251, in <module>
+    eval_model(args)
+  File "/data/users/baoshichao/VisionTrim/llava/eval/model_vqa_loader.py", line 178, in eval_model
+    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+  File "/data/users/baoshichao/VisionTrim/llava/model/builder.py", line 103, in load_pretrained_model
+    model = LlavaLlamaForCausalLM.from_pretrained(
+  File "/idas/users/baoshichao/.conda/envs/visiontrim/lib/python3.10/site-packages/transformers/modeling_utils.py", line 3850, in from_pretrained
+    ) = cls._load_pretrained_model(
+  File "/idas/users/baoshichao/.conda/envs/visiontrim/lib/python3.10/site-packages/transformers/modeling_utils.py", line 4284, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+  File "/idas/users/baoshichao/.conda/envs/visiontrim/lib/python3.10/site-packages/transformers/modeling_utils.py", line 805, in _load_state_dict_into_meta_model
+    set_module_tensor_to_device(model, param_name, param_device, **set_module_kwargs)
+  File "/idas/users/baoshichao/.conda/envs/visiontrim/lib/python3.10/site-packages/accelerate/utils/modeling.py", line 298, in set_module_tensor_to_device
+    new_value = value.to(device)
+torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacty of 23.56 GiB of which 6.06 MiB is free. Process 410388 has 11.80 GiB memory in use. Including non-PyTorch memory, this process has 11.72 GiB memory in use. Of the allocated memory 11.47 GiB is allocated by PyTorch, and 1.55 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting max_split_size_mb to avoid fragmentation.  See documentation for Memory Management and PYTORCH_CUDA_ALLOC_CONF
