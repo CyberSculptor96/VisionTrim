@@ -124,5 +124,8 @@ if __name__ == "__main__":
     parser.add_argument("--method", type=str, default="none")
     parser.add_argument("--dataset-name", type=str, default="none")
     parser.add_argument("--token_num", type=int, default=36)
+    parser.add_argument("--visual-token-num", dest="visual_token_num", type=int, default=None)
+    parser.add_argument("--DVTS_token_num", type=int, default=None)
+    parser.add_argument("--TGVC_token_num", type=int, default=None)
     args = parser.parse_args()
     eval_model(args)

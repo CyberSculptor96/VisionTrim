@@ -10,6 +10,14 @@ from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 
+def load_llama_tokenizer(model_path):
+    # 原实现是在多处分散调用：
+    # AutoTokenizer.from_pretrained(model_path, use_fast=False)
+    # 修改原因：LLaVA-1.5 使用较老的 LLaMA tokenizer 行为；当前 transformers 版本会提示
+    # legacy 兼容差异。统一入口并显式 legacy=True，减少不同加载分支的 tokenizer 行为漂移。
+    return AutoTokenizer.from_pretrained(model_path, use_fast=False, legacy=True)
+
+
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
     if device != "cuda":
@@ -38,7 +46,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         if 'lora' in model_name.lower() and model_base is not None:
             from llava.model.language_model.llava_llama import LlavaConfig
             lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
-            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+            tokenizer = load_llama_tokenizer(model_base)
             print('Loading LLaVA from base model...')
             model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs)
             token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
@@ -80,7 +88,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 cfg_pretrained = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
                 model = LlavaMptForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
             else:
-                tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+                tokenizer = load_llama_tokenizer(model_base)
                 cfg_pretrained = AutoConfig.from_pretrained(model_path)
                 model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
 
@@ -99,7 +107,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     **kwargs
                 )
             else:
-                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+                tokenizer = load_llama_tokenizer(model_path)
                 model = LlavaLlamaForCausalLM.from_pretrained(
                     model_path,
                     low_cpu_mem_usage=True,
@@ -110,7 +118,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         if model_base is not None:
             # PEFT model
             from peft import PeftModel
-            tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
+            tokenizer = load_llama_tokenizer(model_base)
             model = AutoModelForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, **kwargs)
             print(f"Loading LoRA weights from {model_path}")
             model = PeftModel.from_pretrained(model, model_path)
@@ -124,7 +132,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
                 model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
             else:
-                tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+                tokenizer = load_llama_tokenizer(model_path)
                 breakpoint()
                 model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
 

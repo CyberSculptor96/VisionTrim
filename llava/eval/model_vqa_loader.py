@@ -203,6 +203,10 @@ def eval_model(args):
                 temperature=args.temperature,
                 top_p=args.top_p,
                 num_beams=args.num_beams,
+                # 原实现这里没有 min_new_tokens 参数。
+                # 修改原因：POPE 是 yes/no 评估，当前模型第一步有时直接生成 EOS，
+                # 会得到空字符串答案；至少生成 1 个 token 可以避免空答案。
+                min_new_tokens=args.min_new_tokens,
                 max_new_tokens=args.max_new_tokens,
                 output_attentions=False,
                 use_cache=True)
@@ -236,6 +240,10 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--num_beams", type=int, default=1)
+    # 原始评估没有 min_new_tokens；之前为了避免空输出临时设成默认 1。
+    # 后续 POPE 复现实验证明这会把本来要 EOS 的样本强行推成 "Yes"，导致 Yes ratio 接近 1。
+    # 因此默认恢复为 0；只有明确需要强制非空生成时再手动传大于 0 的值。
+    parser.add_argument("--min_new_tokens", type=int, default=0)
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--method", type=str, default='none')
     parser.add_argument("--halfpool", type=str2bool, default='false')
@@ -245,6 +253,9 @@ if __name__ == "__main__":
     parser.add_argument("--qkv", type=str, default="key")
     parser.add_argument("--dataset-name", type=str, default="none")
     parser.add_argument("--token_num", type=int, default=36)
+    parser.add_argument("--visual-token-num", dest="visual_token_num", type=int, default=None)
+    parser.add_argument("--DVTS_token_num", type=int, default=None)
+    parser.add_argument("--TGVC_token_num", type=int, default=None)
     parser.add_argument("--layer", type=str, default="16")
     args = parser.parse_args()
 

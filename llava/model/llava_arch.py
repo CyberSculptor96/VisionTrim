@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 
+import os
 import torch
 import math
 import torch.nn as nn
@@ -13,6 +14,15 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH
 from llava.mm_utils import get_anyres_image_grid_shape
 
 
+def _visiontrim_debug_enabled():
+    return os.environ.get("VISIONTRIM_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _visiontrim_debug(*args, **kwargs):
+    if _visiontrim_debug_enabled():
+        print(*args, **kwargs)
+
+
 class LlavaMetaModel:
 
     def __init__(self, config):
@@ -22,10 +32,10 @@ class LlavaMetaModel:
             self.vision_tower = build_vision_tower(config, delay_load=True)
             self.mm_projector = build_vision_projector(config)
             if self.dtype:
-                print(f"self.dtype is {self.dtype}")
+                _visiontrim_debug(f"self.dtype is {self.dtype}")
                 self.mm_projector = self.mm_projector.to(self.dtype)
-            print(f"mm_projector has been build here.")
-            print(f"the self.mm_projector is {self.mm_projector}")
+            _visiontrim_debug("mm_projector has been build here.")
+            _visiontrim_debug(f"the self.mm_projector is {self.mm_projector}")
             if 'unpad' in getattr(config, 'mm_patch_merge_type', ''):
                 self.image_newline = nn.Parameter(
                     torch.empty(config.hidden_size, dtype=self.dtype)
@@ -38,7 +48,7 @@ class LlavaMetaModel:
         return vision_tower
 
     def initialize_vision_modules(self, model_args, fsdp=None):
-        print("Here use initialize_vision_modules")
+        _visiontrim_debug("Here use initialize_vision_modules")
         vision_tower = model_args.vision_tower
         mm_vision_select_layer = model_args.mm_vision_select_layer
         mm_vision_select_feature = model_args.mm_vision_select_feature
@@ -71,7 +81,7 @@ class LlavaMetaModel:
         self.config.mm_patch_merge_type = mm_patch_merge_type
 
         if getattr(self, 'mm_projector', None) is None:
-            print(f"self.mm_projector is None")
+            _visiontrim_debug("self.mm_projector is None")
             self.mm_projector = build_vision_projector(self.config)
 
             if 'unpad' in mm_patch_merge_type:
@@ -80,7 +90,7 @@ class LlavaMetaModel:
                     torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std
                 )
         else:
-            print(f"self.mm_projector is not None")
+            _visiontrim_debug("self.mm_projector is not None")
             # In case it is frozen by LoRA
             for p in self.mm_projector.parameters():
                 p.requires_grad = True
@@ -103,7 +113,7 @@ class LlavaMetaModel:
             
             # Get pretrained weights
             processed_weights = get_w(mm_projector_weights, 'mm_projector')
-            print(f"the shape of self.mm_projector is {self.mm_projector}")
+            _visiontrim_debug(f"the shape of self.mm_projector is {self.mm_projector}")
 
             # 1. First completely recreate mm_projector
             self.mm_projector = nn.Sequential(
@@ -113,9 +123,10 @@ class LlavaMetaModel:
             ).to(self.dtype)  # Ensure correct data type
 
             # 2. Print shapes before initialization
-            print("\nParameter shapes before initialization:")
-            for name, param in self.mm_projector.named_parameters():
-                print(f"{name}: {param.shape}")
+            if _visiontrim_debug_enabled():
+                print("\nParameter shapes before initialization:")
+                for name, param in self.mm_projector.named_parameters():
+                    print(f"{name}: {param.shape}")
 
             # 3. Manually initialize weights
             for name, param in self.mm_projector.named_parameters():
@@ -124,24 +135,26 @@ class LlavaMetaModel:
                 elif 'bias' in name:
                     nn.init.zeros_(param)
             # 4. Check if parameters are initialized
-            for name, param in self.mm_projector.named_parameters():
-                if param.numel() == 0:  # If parameter size is 0
-                    print(f"Parameter {name} not initialized!")
+            if _visiontrim_debug_enabled():
+                for name, param in self.mm_projector.named_parameters():
+                    if param.numel() == 0:  # If parameter size is 0
+                        print(f"Parameter {name} not initialized!")
        
-            print("\nPretrained weights shapes:")
-            for name, weight in processed_weights.items():
-                print(f"processed_weights['{name}'].shape = {weight.shape}")
+            if _visiontrim_debug_enabled():
+                print("\nPretrained weights shapes:")
+                for name, weight in processed_weights.items():
+                    print(f"processed_weights['{name}'].shape = {weight.shape}")
 
-            print("\nCurrent model parameter shapes:")
-            for name, param in self.mm_projector.named_parameters():
-                print(f"self.mm_projector['{name}'].shape = {param.shape}")
+                print("\nCurrent model parameter shapes:")
+                for name, param in self.mm_projector.named_parameters():
+                    print(f"self.mm_projector['{name}'].shape = {param.shape}")
 
             # Manually load weights and print
             for name, param in self.mm_projector.named_parameters():
                 if name in processed_weights:
-                    print(f"\nLoading {name}:")
-                    print(f"Source shape: {processed_weights[name].shape}")
-                    print(f"Target shape: {param.shape}")
+                    _visiontrim_debug(f"\nLoading {name}:")
+                    _visiontrim_debug(f"Source shape: {processed_weights[name].shape}")
+                    _visiontrim_debug(f"Target shape: {param.shape}")
                     # Ensure dimensions match
                     assert param.shape == processed_weights[name].shape, \
                         f"Shape mismatch for {name}: {param.shape} vs {processed_weights[name].shape}"
@@ -213,12 +226,13 @@ class LlavaMetaForCausalLM(ABC):
     
     def encode_images(self, images, original_qs=None):
         dataset_name = self.get_model().dataset_name if hasattr(self.get_model(), 'dataset_name') else None
-        print(f"the original_qs in encode images is {original_qs}")
+        _visiontrim_debug(f"the original_qs in encode images is {original_qs}")
         if self.get_model().method == "VisionTrim":
             token_num = self.get_model().token_num
-            cls_attn, image_features = self.get_model().get_vision_tower()(images, method=self.get_model().method, dataset_name=dataset_name, start_layer=self.get_model().layer, token_num=token_num, original_qs=original_qs)
+            TGVC_token_num = getattr(self.get_model(), "TGVC_token_num", 0)
+            cls_attn, image_features = self.get_model().get_vision_tower()(images, method=self.get_model().method, dataset_name=dataset_name, start_layer=self.get_model().layer, token_num=token_num, TGVC_token_num=TGVC_token_num, original_qs=original_qs)
         else:
-            print(f"Here is the encode_images function in else")
+            _visiontrim_debug("Here is the encode_images function in else")
             image_features = self.get_model().get_vision_tower()(images, method=self.get_model().method, dataset_name=dataset_name)
         if self.get_model().mm_projector[0].weight.device != image_features.device:
             self.get_model().mm_projector = self.get_model().mm_projector.to(image_features.device)
@@ -444,7 +458,7 @@ class LlavaMetaForCausalLM(ABC):
                     p.requires_grad = False
 
             if model_args.pretrain_mm_mlp_adapter:
-                print(f"here test")
+                _visiontrim_debug("loading pretrained multimodal tokenizer adapter")
                 mm_projector_weights = torch.load(model_args.pretrain_mm_mlp_adapter, map_location='cpu')
                 embed_tokens_weight = mm_projector_weights['model.embed_tokens.weight']
                 assert num_new_tokens == 2

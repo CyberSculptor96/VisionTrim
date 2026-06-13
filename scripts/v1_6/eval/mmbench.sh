@@ -11,6 +11,9 @@ python -W ignore -m llava.eval.model_vqa_mmbench \
     --answers-file ./playground/data/eval/mmbench/answers/${CKPT}/${METHOD}/${PARAM}.jsonl \
     --single-pred-prompt \
     --visual-token-num ${TOKEN} \
+    --method "${METHOD}" \
+    --token_num ${TOKEN} \
+    --dataset-name mmbench \
     --temperature 0 \
     --conv-mode vicuna_v1
 

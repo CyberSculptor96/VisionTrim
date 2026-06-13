@@ -11,6 +11,9 @@ python -m llava.eval.model_vqa_loader \
     --image-folder ./playground/data/eval/vizwiz/test \
     --answers-file ./playground/data/eval/vizwiz/answers/${CKPT}/${METHOD}/${PARAM}.jsonl \
     --visual-token-num ${TOKEN} \
+    --method "${METHOD}" \
+    --token_num ${TOKEN} \
+    --dataset-name vizwiz \
     --temperature 0 \
     --conv-mode vicuna_v1
 

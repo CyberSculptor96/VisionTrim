@@ -1,4 +1,5 @@
 from typing import List, Optional, Tuple, Union
+from dataclasses import dataclass
 import math
 import warnings
 import torch.distributed as dist
@@ -22,6 +23,109 @@ from transformers.generation.utils import GenerateBeamDecoderOnlyOutput,Generate
 import matplotlib.pyplot as plt
 
 GenerateBeamOutput = Union[GenerateBeamDecoderOnlyOutput, GenerateBeamEncoderDecoderOutput]
+
+
+@dataclass(frozen=True)
+class VisionTrimRuntimeConfig:
+    method: str
+    dvts_token_num: int
+    tgvc_token_num: int
+    total_visual_tokens: int
+    layer: Optional[int]
+
+
+@dataclass(frozen=True)
+class VisionTrimAggregationPlan:
+    agg_layer: int
+    should_aggregate: bool
+
+
+def _normalize_visiontrim_method(method):
+    if isinstance(method, str) and method.lower() == "visiontrim":
+        return "VisionTrim"
+    return method
+
+
+def _optional_int(value, default=None):
+    if value is None:
+        return default
+    return int(value)
+
+
+def _visiontrim_debug_enabled():
+    return os.environ.get("VISIONTRIM_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _visiontrim_debug(*args, **kwargs):
+    if _visiontrim_debug_enabled():
+        print(*args, **kwargs)
+
+
+LLAVA15_PAPER_TOKEN_SPLITS = {
+    32: (24, 8),
+    64: (48, 16),
+    128: (96, 32),
+    192: (144, 48),
+}
+
+
+def resolve_visiontrim_config(args):
+    method = _normalize_visiontrim_method(getattr(args, "method", "none"))
+    visual_token_num = getattr(args, "visual_token_num", None)
+    token_num = getattr(args, "token_num", None)
+    dvts_token_num = getattr(args, "DVTS_token_num", None)
+    tgvc_token_num = getattr(args, "TGVC_token_num", None)
+
+    if dvts_token_num is None:
+        requested_total_tokens = visual_token_num if visual_token_num is not None else token_num
+        # 原实现:
+        # dvts_token_num = visual_token_num if visual_token_num is not None else token_num
+        # tgvc_token_num = _optional_int(tgvc_token_num, 0)
+        # 修改原因：README 里的 token_num 表示论文中的总 remaining visual token 数；
+        # 对 LLaVA-1.5，论文 Table 11 明确将 64 tokens 拆成 DVTS=48、TGVC=16。
+        # 因此两参数 README 命令应默认启用 DVTS+TGVC，而不是误跑成纯 DVTS。
+        if (
+            _normalize_visiontrim_method(method) == "VisionTrim"
+            and tgvc_token_num is None
+            and requested_total_tokens is not None
+            and int(requested_total_tokens) in LLAVA15_PAPER_TOKEN_SPLITS
+        ):
+            dvts_token_num, tgvc_token_num = LLAVA15_PAPER_TOKEN_SPLITS[int(requested_total_tokens)]
+        else:
+            dvts_token_num = requested_total_tokens
+    dvts_token_num = _optional_int(dvts_token_num, 36)
+    tgvc_token_num = _optional_int(tgvc_token_num, 0)
+    if dvts_token_num < 0 or tgvc_token_num < 0:
+        raise ValueError("VisionTrim token counts must be non-negative.")
+
+    layer = _optional_int(getattr(args, "layer", None), None)
+    return VisionTrimRuntimeConfig(
+        method=method,
+        dvts_token_num=dvts_token_num,
+        tgvc_token_num=tgvc_token_num,
+        total_visual_tokens=dvts_token_num + tgvc_token_num,
+        layer=layer,
+    )
+
+
+def resolve_visiontrim_aggregation_plan(method, requested_layer, sys_length, image_token_length, attention_rank, seq_length):
+    # 原实现直接把 self.layer 当作 AGG_LAYER 使用，即使 IMAGE_TOKEN_LENGTH == ATTENTION_RANK
+    # 也会强制前若干层 output_attentions=True。此时没有 token 会被继续合并，但 attention
+    # backend 会从正常 SDPA 路径切到手动 attention 路径，POPE 上会造成明显 Yes 偏置。
+    # 因此只有“图像 token 数确实大于保留 rank”时才启用 LLM 内聚合层；否则让 LLM 走原始路径。
+    if _normalize_visiontrim_method(method) != "VisionTrim":
+        return VisionTrimAggregationPlan(agg_layer=-1, should_aggregate=False)
+
+    image_token_length = max(0, int(image_token_length))
+    attention_rank = max(0, min(int(attention_rank), image_token_length))
+    sys_length = max(0, int(sys_length))
+    seq_length = max(0, int(seq_length))
+    should_aggregate = attention_rank > 0 and image_token_length > attention_rank and sys_length + image_token_length < seq_length
+    if not should_aggregate:
+        return VisionTrimAggregationPlan(agg_layer=-1, should_aggregate=False)
+
+    agg_layer = int(requested_layer) if requested_layer is not None else 1
+    return VisionTrimAggregationPlan(agg_layer=max(0, agg_layer), should_aggregate=True)
 
 
 
@@ -382,8 +486,9 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
 
     def __init__(self, config: LlamaConfig):
         super(LlavaLlamaModel, self).__init__(config)
-        print(f"self.model has been initialized in LlavaLlamaModel")
+        _visiontrim_debug("self.model has been initialized in LlavaLlamaModel")
         self.images_idx = None
+        self.image_token_lengths = None
         self.method = None
         self.layers = nn.ModuleList(
             [AdaptiveLlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
@@ -393,18 +498,14 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
         # self.last_attention = None
 
     def post_config(self,args):
-        self.method = args.method
-        self.DVTS_token_num = getattr(args, "DVTS_token_num", None)
-        if self.DVTS_token_num is None:
-            self.DVTS_token_num = getattr(args, "token_num", None)
-        if self.DVTS_token_num is None:
-            self.DVTS_token_num = 36
+        visiontrim_config = resolve_visiontrim_config(args)
+        self.method = visiontrim_config.method
+        self.DVTS_token_num = visiontrim_config.dvts_token_num
         self.token_num = self.DVTS_token_num
-        self.TGVC_token_num = getattr(args, "TGVC_token_num", 0)
-        if self.TGVC_token_num is None:
-            self.TGVC_token_num = 0
-        if hasattr(args, "layer") and args.layer is not None:
-            self.layer = int(args.layer)
+        self.TGVC_token_num = visiontrim_config.tgvc_token_num
+        self.total_visual_tokens = visiontrim_config.total_visual_tokens
+        if visiontrim_config.layer is not None:
+            self.layer = visiontrim_config.layer
         if hasattr(args, "dataset_name"):
             if args.dataset_name != 'none':
                 self.dataset_name = args.dataset_name
@@ -423,7 +524,7 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
         return_dict: Optional[bool] = None,
         new_position_ids: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        print(f"the forward function in LlavaLlamaModel has been called")
+        _visiontrim_debug("the forward function in LlavaLlamaModel has been called")
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -446,8 +547,8 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
                     "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
                 )
                 use_cache = False
-        print(f"the batch_size in forward is {batch_size}")
-        print(f"the seq_length in forward is {seq_length}")
+        _visiontrim_debug(f"the batch_size in forward is {batch_size}")
+        _visiontrim_debug(f"the seq_length in forward is {seq_length}")
         past_key_values_length = 0
         if use_cache:
             use_legacy_cache = not isinstance(past_key_values, Cache)
@@ -525,16 +626,45 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
                     use_cache,
                 )
             else:
-                print(f"self.gradient_checkpointing and self.training is False")
-                print(f"the seq_length: {seq_length}")
+                _visiontrim_debug("self.gradient_checkpointing and self.training is False")
+                _visiontrim_debug(f"the seq_length: {seq_length}")
                 # Token Rerank implementation
                 # Add constant definitions
-                AGG_LAYER = 1  # Corresponds to previous K
-                SYS_LENGTH = 35  # System token length
-                IMAGE_TOKEN_LENGTH = 577  # Image token length (611-35)
+                if self.method == "VisionTrim":
+                    requested_agg_layer = getattr(self, "layer", 1)
+                    if self.images_idx and len(self.images_idx) > 0 and len(self.images_idx[0]) > 0:
+                        SYS_LENGTH = int(self.images_idx[0][0])
+                    else:
+                        SYS_LENGTH = 35
+                    if self.image_token_lengths and len(self.image_token_lengths) > 0 and len(self.image_token_lengths[0]) > 0:
+                        IMAGE_TOKEN_LENGTH = int(self.image_token_lengths[0][0])
+                    else:
+                        IMAGE_TOKEN_LENGTH = int(getattr(self, "total_visual_tokens", getattr(self, "token_num", 0)))
+                    IMAGE_TOKEN_LENGTH = max(0, min(IMAGE_TOKEN_LENGTH, seq_length - SYS_LENGTH))
+                    ATTENTION_RANK = int(getattr(self, "total_visual_tokens", IMAGE_TOKEN_LENGTH))
+                    ATTENTION_RANK = max(0, min(ATTENTION_RANK, IMAGE_TOKEN_LENGTH))
+                    # 原实现:
+                    # AGG_LAYER = getattr(self, "layer", 1)
+                    # 修改原因：当 IMAGE_TOKEN_LENGTH == ATTENTION_RANK 时，LLM 内没有 token 需要合并；
+                    # 继续让 layer 控制前若干层 output_attentions=True 会改变 attention backend，
+                    # 造成 POPE layer ablation 中 layer4 异常偏 Yes。
+                    aggregation_plan = resolve_visiontrim_aggregation_plan(
+                        method=self.method,
+                        requested_layer=requested_agg_layer,
+                        sys_length=SYS_LENGTH,
+                        image_token_length=IMAGE_TOKEN_LENGTH,
+                        attention_rank=ATTENTION_RANK,
+                        seq_length=seq_length,
+                    )
+                    AGG_LAYER = aggregation_plan.agg_layer
+                    SHOULD_AGGREGATE = aggregation_plan.should_aggregate
+                else:
+                    AGG_LAYER = -1
+                    SYS_LENGTH = seq_length
+                    IMAGE_TOKEN_LENGTH = 0
+                    ATTENTION_RANK = 0
+                    SHOULD_AGGREGATE = False
                 TEXT_START = SYS_LENGTH + IMAGE_TOKEN_LENGTH  # Start position of text tokens
-                # ATTENTION_RANK = int(IMAGE_TOKEN_LENGTH * 0.5)  # Number of tokens to retain
-                ATTENTION_RANK = 81
                 if decoder_layer.self_attn.layer_idx < AGG_LAYER and decoder_layer.self_attn.layer_idx != AGG_LAYER - 1:
                     # Normal processing before aggregation layer
                     layer_outputs = decoder_layer(
@@ -557,7 +687,10 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
                     )
                     self.last_attention = layer_outputs[1]
                 elif decoder_layer.self_attn.layer_idx == AGG_LAYER:
-                    has_image = SYS_LENGTH + IMAGE_TOKEN_LENGTH < seq_length
+                    # 原实现:
+                    # has_image = self.method == "VisionTrim" and ATTENTION_RANK > 0 and IMAGE_TOKEN_LENGTH > ATTENTION_RANK and SYS_LENGTH + IMAGE_TOKEN_LENGTH < seq_length
+                    # 修改原因：复用上面集中计算出的 plan，保证“不需要合并”时不会误进入聚合路径。
+                    has_image = SHOULD_AGGREGATE
                     # Get attention scores from the previous layer
                     if has_image and hasattr(self, 'last_attention') and self.last_attention is not None:
                         device = hidden_states.device
@@ -565,7 +698,7 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
                         last_layer_attention = self.last_attention  # [1, 32, 660, 660]
                         last_layer_attention_avg = torch.mean(last_layer_attention, dim=1)[0]  # [660, 660]
 
-                        print(f"if seq_length == last_layer_attention_avg.shape[0]: {seq_length == last_layer_attention_avg.shape[0]}")
+                        _visiontrim_debug(f"if seq_length == last_layer_attention_avg.shape[0]: {seq_length == last_layer_attention_avg.shape[0]}")
                         # Extract attention from image tokens to text tokens
                         image_tokens_range = slice(SYS_LENGTH, SYS_LENGTH + IMAGE_TOKEN_LENGTH)  # Range of image tokens
                         text_tokens_range = slice(TEXT_START, seq_length)  # Range of text tokens
@@ -624,14 +757,14 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
                             # Update target_hidden
                             target_hidden = target_hidden + aggregated_hidden
 
-                        print(f"Original hidden_states shape: {hidden_states.shape}")
+                        _visiontrim_debug(f"Original hidden_states shape: {hidden_states.shape}")
                         # Update hidden states in keep_indexs
                         hidden_states = torch.cat((
                             hidden_states[:, :SYS_LENGTH, :],                    # System tokens
                             target_hidden,                                       # Merged image tokens
                             hidden_states[:, TEXT_START:seq_length, :]          # Text tokens
                         ), dim=1)
-                        print(f"Pruned hidden_states shape: {hidden_states.shape}")
+                        _visiontrim_debug(f"Pruned hidden_states shape: {hidden_states.shape}")
                         # Retain necessary tokens
                         keep_indexs = torch.cat((
                             torch.arange(SYS_LENGTH, device=device),  # System tokens
@@ -679,7 +812,7 @@ class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
                         
                     # Check the range of position_ids
                     if position_ids is not None:
-                        print("An error has occurred in position_ids")
+                        _visiontrim_debug("position_ids is not None after aggregation layer")
             
             hidden_states = layer_outputs[0]
             if use_cache:
@@ -712,7 +845,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
     def __init__(self, config):
         super(LlamaForCausalLM, self).__init__(config)
         self.model = LlavaLlamaModel(config)
-        print(f"self.model has been initialized in LlavaLlamaForCausalLM")
+        _visiontrim_debug("self.model has been initialized in LlavaLlamaForCausalLM")
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -745,7 +878,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         new_position_ids: Optional[torch.LongTensor] = None,
         sample_ids = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        print(f"the forward function in LlavaLlamaForCausalLM has been called")
+        _visiontrim_debug("the forward function in LlavaLlamaForCausalLM has been called")
         if inputs_embeds is None:
             (
                 input_ids,
@@ -771,7 +904,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        print(f"the prepare_inputs_labels_for_multimodal in forward has been called")
+        _visiontrim_debug("the prepare_inputs_labels_for_multimodal in forward has been called")
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -860,9 +993,37 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
         self.model.images_idx = images_idx
+        if images is None:
+            self.model.image_token_lengths = None
         if images is not None:
             kwargs['new_position_ids'] = new_position_ids
-        print(f"the prepare_inputs_labels_for_multimodal in generate has been called")
+        _visiontrim_debug("the prepare_inputs_labels_for_multimodal in generate has been called")
+        if images is not None:
+            # 原实现直接用 inputs_embeds 调 super().generate：
+            # return super().generate(
+            #     position_ids=position_ids,
+            #     attention_mask=attention_mask,
+            #     inputs_embeds=inputs_embeds,
+            #     **kwargs
+            # )
+            # 修改原因：当前 transformers 版本在多模态 inputs_embeds 生成时需要一个与
+            # prompt 长度对齐的 inputs，否则输出序列边界和后续 batch_decode 容易不一致，
+            # POPE smoke test 中表现为空答案。这里用 dummy_input_ids 占位 prompt，
+            # 生成后裁掉 dummy prompt，只返回真正的新生成 token。
+            dummy_input_ids = torch.zeros(
+                inputs_embeds.shape[:2],
+                dtype=torch.long,
+                device=inputs_embeds.device,
+            )
+            output_ids = super().generate(
+                inputs=dummy_input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                **kwargs
+            )
+            return output_ids[:, dummy_input_ids.shape[1]:]
+
         return super().generate(
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -892,6 +1053,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels,None
         images_idx = []
+        image_token_lengths = []
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
@@ -969,6 +1131,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         cur_image_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
             image_id = []
+            image_lengths = []
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
 
             if num_images > 0:
@@ -993,6 +1156,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 new_labels.append(labels[batch_idx])
                 cur_image_idx += 1
                 images_idx.append(image_id)
+                image_token_lengths.append(image_lengths)
                 continue
             image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]]
             cur_input_ids_noim = []
@@ -1014,7 +1178,8 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 if i < num_images:
                     cur_image_features = image_features[cur_image_idx]
                     image_id += [cur_idx]
-                    cur_idx += image_features[cur_image_idx].shape[0]
+                    image_lengths += [cur_image_features.shape[0]]
+                    cur_idx += cur_image_features.shape[0]
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
@@ -1025,6 +1190,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             new_input_embeds.append(cur_new_input_embeds)
             new_labels.append(cur_new_labels)
             images_idx.append(image_id)
+            image_token_lengths.append(image_lengths)
 
         # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, 'tokenizer_model_max_length', None)
@@ -1074,6 +1240,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
 
         if _position_ids is None:
             position_ids = None
+        self.model.image_token_lengths = image_token_lengths
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, images_idx, None
     
 

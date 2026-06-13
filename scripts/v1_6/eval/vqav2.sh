@@ -19,6 +19,9 @@ for IDX in $(seq 0 $((CHUNKS-1))); do
         --num-chunks ${CHUNKS} \
         --chunk-idx ${IDX} \
         --visual-token-num ${TOKEN} \
+        --method "${METHOD}" \
+        --token_num ${TOKEN} \
+        --dataset-name vqav2 \
         --temperature 0 \
         --conv-mode vicuna_v1 &
 done
@@ -40,4 +43,3 @@ python scripts/convert_vqav2_for_submission.py \
     --dir ${VQAV2DIR} \
     --src answers/${CKPT}/${METHOD}/${PARAM}/merge.jsonl \
     --dst answers_upload/${CKPT}/${METHOD}/${PARAM}/upload.json
-

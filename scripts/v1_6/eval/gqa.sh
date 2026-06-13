@@ -48,6 +48,9 @@ for IDX in $(seq 0 $((CHUNKS-1))); do
         --num-chunks ${CHUNKS} \
         --chunk-idx ${IDX} \
         --visual-token-num ${TOKEN} \
+        --method "${METHOD}" \
+        --token_num ${TOKEN} \
+        --dataset-name gqa \
         --temperature 0 \
         --conv-mode vicuna_v1 &
 done
