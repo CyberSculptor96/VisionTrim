@@ -11,6 +11,9 @@ python -W ignore -m llava.eval.model_vqa_loader \
     --image-folder ./playground/data/eval/pope/val2014 \
     --answers-file ./playground/data/eval/pope/answers/${CKPT}/${METHOD}/${PARAM}.jsonl \
     --visual-token-num ${TOKEN} \
+    --method "${METHOD}" \
+    --token_num ${TOKEN} \
+    --dataset-name pope \
     --temperature 0 \
     --conv-mode vicuna_v1
 

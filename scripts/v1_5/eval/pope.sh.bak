@@ -1,0 +1,42 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT_DIR=${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}
+DATA_DIR=${POPE_DATA_DIR:-"$ROOT_DIR/playground/data/eval/pope"}
+METHOD=${METHOD:-VisionTrim}
+CKPT=${CKPT:-/data/users/baoshichao/llava-v1.5-7b}
+GPU_ID=${GPU_ID:-0}
+
+if [[ $# -ne 2 ]]; then
+    echo "Usage: GPU_ID=0 CKPT=/path/to/llava-v1.5-7b bash $0 <layer> <token_num>"
+    exit 1
+fi
+
+layer=$1
+token_num=$2
+answers_file="$DATA_DIR/answers/$METHOD/$token_num.jsonl"
+
+if [[ ! -d "$DATA_DIR/coco" || ! -d "$DATA_DIR/val2014" || ! -f "$DATA_DIR/llava_pope_test.jsonl" ]]; then
+    echo "Missing POPE data under $DATA_DIR"
+    exit 1
+fi
+
+mkdir -p "$(dirname "$answers_file")"
+cd "$ROOT_DIR"
+
+CUDA_VISIBLE_DEVICES=$GPU_ID python -m llava.eval.model_vqa_loader \
+    --model-path "$CKPT" \
+    --question-file "$DATA_DIR/llava_pope_test.jsonl" \
+    --image-folder "$DATA_DIR/val2014" \
+    --answers-file "$answers_file" \
+    --temperature 0 \
+    --conv-mode vicuna_v1 \
+    --dataset-name pope \
+    --method "$METHOD" \
+    --layer "$layer" \
+    --token_num "$token_num"
+
+python llava/eval/eval_pope.py \
+    --annotation-dir "$DATA_DIR/coco" \
+    --question-file "$DATA_DIR/llava_pope_test.jsonl" \
+    --result-file "$answers_file"

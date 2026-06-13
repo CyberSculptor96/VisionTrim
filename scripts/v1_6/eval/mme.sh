@@ -11,6 +11,9 @@ python -W ignore -m llava.eval.model_vqa_loader \
     --image-folder ./playground/data/eval/MME/MME_Benchmark_release_version \
     --answers-file ./playground/data/eval/MME/answers/${CKPT}/${METHOD}/${PARAM}.jsonl \
     --visual-token-num ${TOKEN} \
+    --method "${METHOD}" \
+    --token_num ${TOKEN} \
+    --dataset-name mme \
     --temperature 0 \
     --conv-mode vicuna_v1
 

@@ -12,6 +12,9 @@ python -W ignore -m llava.eval.model_vqa_mmbench \
     --lang cn \
     --single-pred-prompt \
     --visual-token-num ${TOKEN} \
+    --method "${METHOD}" \
+    --token_num ${TOKEN} \
+    --dataset-name mmbench_cn \
     --temperature 0 \
     --conv-mode vicuna_v1
 
